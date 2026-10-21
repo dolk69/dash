@@ -1,0 +1,88 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { checkSvg } from "../src/svgsafe";
+
+const ok = (s: string) => checkSvg(s).ok;
+const why = (s: string) => checkSvg(s).error ?? "";
+
+// The shapes a real favicon actually takes. A validator that rejects
+// these is worse than no SVG support at all - it looks like a bug.
+test("svg: ordinary favicons pass", () => {
+  assert.ok(ok('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><circle cx="16" cy="16" r="14" fill="#4f8"/></svg>'));
+  assert.ok(ok('<?xml version="1.0" encoding="UTF-8"?>\n<svg viewBox="0 0 16 16"><path d="M1 1h14v14H1z"/></svg>'));
+  assert.ok(ok('<!-- drawn by hand -->\n<svg viewBox="0 0 16 16"><rect width="16" height="16"/></svg>'));
+  assert.ok(ok('<svg viewBox="0 0 16 16"><style>circle { fill: red }</style><circle r="8"/></svg>'));
+  // dark-mode-adaptive, the reason to want SVG for a favicon at all
+  assert.ok(ok('<svg viewBox="0 0 16 16"><style>@media (prefers-color-scheme: dark){path{fill:#fff}}</style><path d="M0 0h16v16H0z"/></svg>'));
+});
+
+// A same-document fragment is how gradients and <use> are legitimately
+// wired up. An early version of this validator rejected href="#id"
+// because a negative lookahead backtracked past the opening quote.
+test("svg: same-document references are allowed", () => {
+  assert.ok(ok('<svg viewBox="0 0 16 16"><defs><linearGradient id="g"/></defs><rect fill="url(#g)" width="16" height="16"/></svg>'));
+  assert.ok(ok('<svg viewBox="0 0 16 16"><defs><path id="p" d="M0 0h8v8H0z"/></defs><use href="#p"/></svg>'));
+  assert.ok(ok("<svg viewBox='0 0 16 16'><use xlink:href='#p'/></svg>"), "single quotes too");
+  assert.ok(ok('<svg viewBox="0 0 16 16"><image href="data:image/png;base64,iVBORw0KGgo="/></svg>'), "inline bytes carry no fetch");
+});
+
+test("svg: script in every spelling is refused", () => {
+  assert.ok(!ok('<svg><script>alert(1)</script></svg>'));
+  assert.ok(!ok('<svg><svg:script>alert(1)</svg:script></svg>'), "a namespace prefix is still a script element");
+  assert.ok(!ok('<svg><SCRIPT>alert(1)</SCRIPT></svg>'), "case is not a defence");
+  assert.ok(!ok('<svg onload="alert(1)"><circle r="8"/></svg>'));
+  assert.ok(!ok('<svg><circle r="8" onclick = "alert(1)"/></svg>'), "spaces around = do not hide it");
+  assert.ok(!ok('<svg><a href="javascript:alert(1)"><text>x</text></a></svg>'));
+});
+
+// The ones that do not contain the word "script" anywhere.
+test("svg: the indirect script routes are refused", () => {
+  assert.ok(!ok('<svg><foreignObject><body xmlns="http://www.w3.org/1999/xhtml"><img src=x onerror=alert(1)></body></foreignObject></svg>'));
+  assert.ok(
+    !ok('<svg><a id="x"><animate attributeName="href" to="javascript:alert(1)" begin="0s"/></a></svg>'),
+    "SMIL can animate an attribute into a javascript: URL",
+  );
+  assert.ok(!ok('<svg><iframe src="https://evil.example"/></svg>'));
+});
+
+test("svg: XML-layer attacks are refused before anything else", () => {
+  assert.ok(!ok('<!DOCTYPE svg [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><svg><text>&xxe;</text></svg>'));
+  assert.match(why('<!DOCTYPE svg><svg/>'), /DOCTYPE/);
+  assert.match(why('<svg><!ENTITY a "b"></svg>'), /entity/);
+});
+
+// The file must BE an SVG, not merely contain one - a document that
+// parses as something else first is the classic polyglot.
+test("svg: the root element must be svg", () => {
+  assert.ok(!ok('<html><body><svg viewBox="0 0 16 16"/></body></html>'));
+  assert.ok(!ok('GIF89a<svg viewBox="0 0 16 16"/>'));
+  assert.ok(!ok(""));
+  assert.ok(!ok("   \n  "));
+  assert.match(why('{"not":"svg"}'), /root element/);
+});
+
+test("svg: anything that reaches the network is refused", () => {
+  assert.ok(!ok('<svg><image href="https://evil.example/pixel.png"/></svg>'), "a remote image is a beacon");
+  assert.ok(!ok('<svg><use xlink:href="https://evil.example/x.svg#p"/></svg>'));
+  assert.ok(!ok('<svg><style>@import url("https://evil.example/x.css");</style></svg>'));
+  assert.ok(!ok('<svg><rect style="fill: url(https://evil.example/x.svg#g)"/></svg>'));
+  assert.ok(!ok('<svg><rect fill="url(\'https://evil.example/x.svg#g\')"/></svg>'));
+});
+
+test("svg: a NUL byte means it is not the text document it claims to be", () => {
+  assert.ok(!ok('<svg viewBox="0 0 16 16">\u0000<circle r="8"/></svg>'));
+  assert.match(why('<svg>\u0000</svg>'), /text document/);
+});
+
+// Every rejection has to say what was wrong: the user is about to edit a
+// file by hand and try again.
+test("svg: refusals name the reason", () => {
+  for (const [src, expected] of [
+    ['<svg><script/></svg>', /script/],
+    ['<svg onload="x"/>', /event-handler/],
+    ['<svg><foreignObject/></svg>', /foreignObject/],
+    ['<svg><image href="https://e.example/x.png"/></svg>', /external reference/],
+  ] as [string, RegExp][]) {
+    assert.match(why(src), expected);
+  }
+});
